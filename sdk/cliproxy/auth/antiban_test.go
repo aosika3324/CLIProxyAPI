@@ -21,14 +21,44 @@ func resetAntiBan() {
 
 func TestAcquireAntiBanSlotDisabledIsNoop(t *testing.T) {
 	resetAntiBan()
-	release, err := acquireAntiBanSlot(context.Background(), "auth-1")
+	release, holdsSlot, err := acquireAntiBanSlot(context.Background(), "auth-1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if release == nil {
 		t.Fatal("release must never be nil")
 	}
+	if holdsSlot {
+		t.Fatal("disabled anti-ban must not hold a slot")
+	}
 	release() // must not panic
+}
+
+func TestAcquireAntiBanSlotHoldsSlotOnlyWhenLimited(t *testing.T) {
+	resetAntiBan()
+	defer resetAntiBan()
+
+	// Unlimited concurrency (0) with jitter only: no slot held.
+	SetAntiBanConfig(true, 0, 0, 0, 0, 0, false)
+	rel, holds, err := acquireAntiBanSlot(context.Background(), "auth-x")
+	if err != nil {
+		t.Fatalf("acquire failed: %v", err)
+	}
+	if holds {
+		t.Fatal("unlimited concurrency must not hold a slot")
+	}
+	rel()
+
+	// Limit 2: slot held.
+	SetAntiBanConfig(true, 2, 0, 0, 0, 0, false)
+	rel2, holds2, err2 := acquireAntiBanSlot(context.Background(), "auth-y")
+	if err2 != nil {
+		t.Fatalf("acquire failed: %v", err2)
+	}
+	if !holds2 {
+		t.Fatal("limited concurrency must hold a slot")
+	}
+	rel2()
 }
 
 func TestAcquireAntiBanSlotLimitsConcurrency(t *testing.T) {
@@ -37,7 +67,7 @@ func TestAcquireAntiBanSlotLimitsConcurrency(t *testing.T) {
 	SetAntiBanConfig(true, 1, 0, 0, 0, 0, false)
 	defer resetAntiBan()
 
-	rel1, err := acquireAntiBanSlot(context.Background(), "auth-1")
+	rel1, _, err := acquireAntiBanSlot(context.Background(), "auth-1")
 	if err != nil {
 		t.Fatalf("first acquire failed: %v", err)
 	}
@@ -47,7 +77,7 @@ func TestAcquireAntiBanSlotLimitsConcurrency(t *testing.T) {
 	var rel2 antiBanRelease
 	done := make(chan struct{})
 	go func() {
-		r, errAcq := acquireAntiBanSlot(context.Background(), "auth-1")
+		r, _, errAcq := acquireAntiBanSlot(context.Background(), "auth-1")
 		if errAcq == nil {
 			acquired.Store(true)
 			rel2 = r
@@ -78,7 +108,7 @@ func TestAcquireAntiBanSlotDifferentAuthsIndependent(t *testing.T) {
 	SetAntiBanConfig(true, 1, 0, 0, 0, 0, false)
 	defer resetAntiBan()
 
-	rel1, err := acquireAntiBanSlot(context.Background(), "auth-1")
+	rel1, _, err := acquireAntiBanSlot(context.Background(), "auth-1")
 	if err != nil {
 		t.Fatalf("acquire auth-1 failed: %v", err)
 	}
@@ -87,7 +117,7 @@ func TestAcquireAntiBanSlotDifferentAuthsIndependent(t *testing.T) {
 	// A different auth has its own slot and must not block.
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	rel2, err := acquireAntiBanSlot(ctx, "auth-2")
+	rel2, _, err := acquireAntiBanSlot(ctx, "auth-2")
 	if err != nil {
 		t.Fatalf("acquire auth-2 should not block: %v", err)
 	}
@@ -100,13 +130,13 @@ func TestAcquireAntiBanSlotWaitTimeout(t *testing.T) {
 	SetAntiBanConfig(true, 1, 30, 0, 0, 0, false)
 	defer resetAntiBan()
 
-	rel1, err := acquireAntiBanSlot(context.Background(), "auth-1")
+	rel1, _, err := acquireAntiBanSlot(context.Background(), "auth-1")
 	if err != nil {
 		t.Fatalf("first acquire failed: %v", err)
 	}
 	defer rel1()
 
-	_, err = acquireAntiBanSlot(context.Background(), "auth-1")
+	_, _, err = acquireAntiBanSlot(context.Background(), "auth-1")
 	if err == nil {
 		t.Fatal("expected timeout error when slot unavailable past wait window")
 	}
@@ -117,7 +147,7 @@ func TestAcquireAntiBanSlotContextCancel(t *testing.T) {
 	SetAntiBanConfig(true, 1, 0, 0, 0, 0, false)
 	defer resetAntiBan()
 
-	rel1, err := acquireAntiBanSlot(context.Background(), "auth-1")
+	rel1, _, err := acquireAntiBanSlot(context.Background(), "auth-1")
 	if err != nil {
 		t.Fatalf("first acquire failed: %v", err)
 	}
@@ -128,7 +158,7 @@ func TestAcquireAntiBanSlotContextCancel(t *testing.T) {
 		time.Sleep(30 * time.Millisecond)
 		cancel()
 	}()
-	_, err = acquireAntiBanSlot(ctx, "auth-1")
+	_, _, err = acquireAntiBanSlot(ctx, "auth-1")
 	if err == nil {
 		t.Fatal("expected context cancellation error")
 	}
@@ -220,4 +250,38 @@ func TestWrapStreamReleaseOnNilResult(t *testing.T) {
 	if released.Load() != 1 {
 		t.Fatal("nil result should release immediately")
 	}
+}
+
+// TestAntiBanGateConcurrentResize exercises the per-auth gate while the
+// concurrency limit is flipped under it, guarding against the data race that
+// would occur if callers read g.sem outside the gate lock. Run with -race.
+func TestAntiBanGateConcurrentResize(t *testing.T) {
+	resetAntiBan()
+	defer resetAntiBan()
+
+	var wg sync.WaitGroup
+	stop := time.Now().Add(200 * time.Millisecond)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for time.Now().Before(stop) {
+			SetAntiBanConfig(true, 1, 1, 0, 0, 0, false)
+			SetAntiBanConfig(true, 3, 1, 0, 0, 0, false)
+		}
+	}()
+
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(stop) {
+				r, _, err := acquireAntiBanSlot(context.Background(), "same-auth")
+				if err == nil {
+					r()
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }

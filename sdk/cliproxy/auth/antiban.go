@@ -129,11 +129,14 @@ func antiBanRequireProxy() bool {
 	return s != nil && s.enabled && s.requireProxy
 }
 
-// gateFor returns (creating if needed) the gate for an auth ID, sized to the
-// current concurrency limit. If the limit changed since the gate was created the
-// semaphore is rebuilt; in-flight holders drain naturally against the old channel
-// because release closes over the channel it acquired.
-func (st *antiBanState) gateFor(id string, limit int) *antiBanGate {
+// gateFor returns the gate for an auth ID along with the semaphore channel to use
+// for this acquisition, sized to the current concurrency limit. The channel is
+// captured under st.mu and returned by value so callers never read g.sem outside
+// the lock (which would race with a concurrent hot-reload resize). A nil channel
+// means concurrency is unlimited. When the limit changes the semaphore is rebuilt;
+// in-flight holders keep draining against the channel they captured, so a resize
+// is safe (it may briefly over- or under-admit during the transition).
+func (st *antiBanState) gateFor(id string, limit int) (*antiBanGate, chan struct{}) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	g, ok := st.gates[id]
@@ -143,7 +146,7 @@ func (st *antiBanState) gateFor(id string, limit int) *antiBanGate {
 			g.sem = make(chan struct{}, limit)
 		}
 		st.gates[id] = g
-		return g
+		return g, g.sem
 	}
 	// Resize the semaphore when the configured limit changes.
 	if limit > 0 && (g.sem == nil || cap(g.sem) != limit) {
@@ -151,7 +154,7 @@ func (st *antiBanState) gateFor(id string, limit int) *antiBanGate {
 	} else if limit <= 0 {
 		g.sem = nil
 	}
-	return g
+	return g, g.sem
 }
 
 // antiBanRelease is returned by acquireAntiBanSlot and must be called exactly once
@@ -162,24 +165,29 @@ type antiBanRelease func()
 //  1. block until a per-auth concurrency slot is free (or ctx/timeout fires),
 //  2. wait out the larger of remaining min-interval spacing and a random jitter.
 //
-// It returns a release function (never nil) and an error only if the context was
-// cancelled or the concurrency wait timed out. When anti-ban is disabled the
-// release is a no-op and no waiting occurs.
-func acquireAntiBanSlot(ctx context.Context, authID string) (antiBanRelease, error) {
+// Returns (release, holdsSlot, error). release is never nil and must be called
+// once. holdsSlot is true only when an actual concurrency slot was taken (limit
+// > 0); callers use it to decide whether a streaming response must hold the slot
+// until drain. error is non-nil only on ctx cancellation or concurrency-wait
+// timeout. When anti-ban is disabled the release is a no-op, holdsSlot is false,
+// and no waiting occurs.
+func acquireAntiBanSlot(ctx context.Context, authID string) (antiBanRelease, bool, error) {
 	s := antiBan.settings.load()
 	if s == nil || !s.enabled || authID == "" {
-		return func() {}, nil
+		return func() {}, false, nil
 	}
 
-	g := antiBan.gateFor(authID, s.maxConcurrentPerAuth)
+	g, sem := antiBan.gateFor(authID, s.maxConcurrentPerAuth)
 
-	// Step 1: concurrency slot.
+	// Step 1: concurrency slot. Use the channel captured under the gate lock so a
+	// concurrent hot-reload resize cannot race this read.
 	release := antiBanRelease(func() {})
-	if g.sem != nil {
-		if err := acquireSem(ctx, g.sem, s.concurrencyWait); err != nil {
-			return func() {}, err
+	holdsSlot := false
+	if sem != nil {
+		if err := acquireSem(ctx, sem, s.concurrencyWait); err != nil {
+			return func() {}, false, err
 		}
-		sem := g.sem
+		holdsSlot = true
 		release = func() {
 			select {
 			case <-sem:
@@ -196,11 +204,11 @@ func acquireAntiBanSlot(ctx context.Context, authID string) (antiBanRelease, err
 		case <-ctx.Done():
 			timer.Stop()
 			release()
-			return func() {}, ctx.Err()
+			return func() {}, false, ctx.Err()
 		}
 	}
 	g.markDispatch()
-	return release, nil
+	return release, holdsSlot, nil
 }
 
 // acquireSem takes one slot from sem, honoring ctx and an optional wait timeout.

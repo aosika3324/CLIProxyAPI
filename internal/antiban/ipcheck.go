@@ -197,10 +197,11 @@ func authDisplayName(a AuthSnapshot) string {
 	return "(unknown)"
 }
 
-// lookupEgress resolves the egress IP and reputation by querying public databases
-// through the credential's proxy. It tries ipapi.is first (richest signal), then
-// falls back to ip-api.com and ipinfo.io. Any single source that flags datacenter
-// or hosting is treated as authoritative.
+// lookupEgress resolves the egress IP and reputation by cross-verifying across
+// public databases through the credential's proxy, mirroring the deployment
+// guide's "三个数据库交叉验证" rule: query every reachable source and treat the IP
+// as risky if ANY source flags it as datacenter/hosting. At least one source must
+// respond or the lookup errors.
 func lookupEgress(ctx context.Context, proxyURL string, timeout time.Duration) (ipResult, error) {
 	transport, mode, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
 	if errBuild != nil {
@@ -211,19 +212,41 @@ func lookupEgress(ctx context.Context, proxyURL string, timeout time.Duration) (
 	}
 	client := &http.Client{Transport: transport, Timeout: timeout}
 
-	// ipapi.is: is_datacenter / company / asn fields.
-	if r, ok := queryIPApiIs(ctx, client); ok {
-		return r, nil
+	sources := []func(context.Context, *http.Client) (ipResult, bool){
+		queryIPApiIs,  // is_datacenter / company / asn
+		queryIPApiCom, // hosting / proxy flag + isp
+		queryIPInfo,   // org / hostname (weakest)
 	}
-	// ip-api.com: hosting flag + isp.
-	if r, ok := queryIPApiCom(ctx, client); ok {
-		return r, nil
+
+	merged := ipResult{}
+	got := false
+	var contributing []string
+	for _, q := range sources {
+		r, ok := q(ctx, client)
+		if !ok {
+			continue
+		}
+		got = true
+		contributing = append(contributing, r.source)
+		if merged.ip == "" {
+			merged.ip = r.ip
+		}
+		// OR the risk signals: any source flagging datacenter/hosting wins.
+		merged.isDatacenter = merged.isDatacenter || r.isDatacenter
+		merged.isHosting = merged.isHosting || r.isHosting
+		// Prefer the first non-empty ISP/hostname for human-readable context.
+		if merged.isp == "" {
+			merged.isp = r.isp
+		}
+		if merged.hostname == "" {
+			merged.hostname = r.hostname
+		}
 	}
-	// ipinfo.io: org/hostname (weaker signal, last resort).
-	if r, ok := queryIPInfo(ctx, client); ok {
-		return r, nil
+	if !got {
+		return ipResult{}, fmt.Errorf("all egress IP reputation lookups failed")
 	}
-	return ipResult{}, fmt.Errorf("all egress IP reputation lookups failed")
+	merged.source = strings.Join(contributing, "+")
+	return merged, nil
 }
 
 func fetchJSON(ctx context.Context, client *http.Client, url string, out any) bool {

@@ -1550,7 +1550,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(ctx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			// Anti-ban: gate per-auth concurrency and apply rhythm jitter before dispatch.
-			release, errGate := acquireAntiBanSlot(ctx, auth.ID)
+			release, holdsSlot, errGate := acquireAntiBanSlot(ctx, auth.ID)
 			if errGate != nil {
 				loopReturn = true
 				loopErr = errGate
@@ -1650,11 +1650,19 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				close(closedCh)
 				remaining = closedCh
 			}
-			// Success: transfer slot ownership to the streamed channel so the slot
-			// stays held for the whole response, released when the stream drains.
+			// Success: when an actual concurrency slot is held, transfer its
+			// ownership to the streamed channel so the slot stays held for the whole
+			// response, released when the stream drains. When no slot is held
+			// (anti-ban off, unlimited, or jitter-only) skip the extra wrapper to
+			// avoid a per-chunk goroutine hop on the hot path.
 			slotHeld = false
 			wrapped := m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining)
-			loopResult = wrapStreamReleaseOnDrain(ctx, wrapped, release)
+			if holdsSlot {
+				loopResult = wrapStreamReleaseOnDrain(ctx, wrapped, release)
+			} else {
+				release()
+				loopResult = wrapped
+			}
 			loopReturn = true
 		}()
 		if loopReturn {
@@ -2280,7 +2288,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			// Anti-ban: gate per-auth concurrency and apply rhythm jitter before dispatch.
-			release, errGate := acquireAntiBanSlot(execCtx, auth.ID)
+			release, _, errGate := acquireAntiBanSlot(execCtx, auth.ID)
 			if errGate != nil {
 				return cliproxyexecutor.Response{}, errGate
 			}
