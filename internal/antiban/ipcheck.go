@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -39,6 +40,11 @@ type AuthLister func() []AuthSnapshot
 // It is typically coreauth.SetDatacenterBlockedAuths.
 type BlockSetter func(ids []string)
 
+// BlockGetter returns the auth IDs currently held out of rotation by strict mode.
+// It is typically coreauth.GetDatacenterBlockedAuths and lets the checker preserve
+// existing blocks across a pass where a credential's lookup transiently fails.
+type BlockGetter func() []string
+
 // ipResult captures what the reputation lookups concluded for one egress IP.
 type ipResult struct {
 	ip           string
@@ -59,20 +65,31 @@ type egressFinding struct {
 
 // Checker runs egress IP self-checks on a schedule.
 type Checker struct {
-	lister   AuthLister
-	getCfg   func() *config.Config
-	setBlock BlockSetter
+	lister     AuthLister
+	getCfg     func() *config.Config
+	setBlock   BlockSetter
+	getBlocked BlockGetter
+
+	// running guards the background loop so Start is idempotent and re-entrant:
+	// it can be called repeatedly (startup + every hot reload) without spawning
+	// duplicate loops, and will (re)start the loop after it has exited (one-shot
+	// completed, or the feature was toggled off then on again).
+	running atomic.Bool
 }
 
 // NewChecker builds a checker. lister enumerates credentials, getCfg returns the
-// live config (so hot-reloads take effect), and setBlock installs strict-mode
-// blocks (may be nil to disable strict enforcement).
-func NewChecker(lister AuthLister, getCfg func() *config.Config, setBlock BlockSetter) *Checker {
-	return &Checker{lister: lister, getCfg: getCfg, setBlock: setBlock}
+// live config (so hot-reloads take effect), setBlock installs strict-mode blocks
+// (may be nil to disable strict enforcement), and getBlocked returns the current
+// block set so transient lookup failures preserve existing blocks (may be nil).
+func NewChecker(lister AuthLister, getCfg func() *config.Config, setBlock BlockSetter, getBlocked BlockGetter) *Checker {
+	return &Checker{lister: lister, getCfg: getCfg, setBlock: setBlock, getBlocked: getBlocked}
 }
 
-// Start launches the self-check. It runs once immediately, then on the configured
-// interval (if any). It returns immediately; the loop stops when ctx is cancelled.
+// Start launches the self-check loop if the feature is enabled and the loop is not
+// already running. It is safe to call repeatedly (startup and on every config hot
+// reload): a no-op while running or disabled, it (re)starts the loop when the
+// feature has just been enabled or a previous one-shot pass has finished. The loop
+// stops when ctx is cancelled, the feature is disabled, or a one-shot pass ends.
 func (c *Checker) Start(ctx context.Context) {
 	if c == nil || c.lister == nil || c.getCfg == nil {
 		return
@@ -81,7 +98,13 @@ func (c *Checker) Start(ctx context.Context) {
 	if cfg == nil || !cfg.AntiBan.Enabled || !cfg.AntiBan.IPCheck.Enabled {
 		return
 	}
-	go c.loop(ctx)
+	if !c.running.CompareAndSwap(false, true) {
+		return // already running
+	}
+	go func() {
+		defer c.running.Store(false)
+		c.loop(ctx)
+	}()
 }
 
 func (c *Checker) loop(ctx context.Context) {
@@ -152,9 +175,28 @@ func (c *Checker) report(findings []egressFinding, settings config.AntiBanIPChec
 	var datacenterIDs []string
 	ipToAuths := make(map[string][]string)
 
+	// Seed of credentials already blocked from a prior pass. A credential is only
+	// unblocked by a fresh confirmed-clean result; a transient lookup failure must
+	// NOT silently restore a known datacenter-egress credential to rotation.
+	var prevBlocked map[string]struct{}
+	if settings.StrictDatacenter && c.getBlocked != nil {
+		ids := c.getBlocked()
+		if len(ids) > 0 {
+			prevBlocked = make(map[string]struct{}, len(ids))
+			for _, id := range ids {
+				prevBlocked[id] = struct{}{}
+			}
+		}
+	}
+
 	for _, f := range findings {
 		if f.err != nil {
 			log.Warnf("anti-ban ip-check: credential %s egress lookup failed: %v", f.label, f.err)
+			// Carry forward an existing block across the transient failure.
+			if _, ok := prevBlocked[f.authID]; ok {
+				datacenterIDs = append(datacenterIDs, f.authID)
+				log.Warnf("anti-ban ip-check: credential %s stays blocked (prior datacenter detection retained across failed re-check)", f.label)
+			}
 			continue
 		}
 		r := f.result
@@ -207,9 +249,9 @@ func authDisplayName(a AuthSnapshot) string {
 
 // lookupEgress resolves the egress IP and reputation by cross-verifying across
 // public databases through the credential's proxy, mirroring the deployment
-// guide's "三个数据库交叉验证" rule: query every reachable source and treat the IP
-// as risky if ANY source flags it as datacenter/hosting. At least one source must
-// respond or the lookup errors.
+// guide's "cross-verify across three databases" rule: query every reachable source
+// and treat the IP as risky if ANY source flags it as datacenter/hosting. At least
+// one source must respond or the lookup errors.
 func lookupEgress(ctx context.Context, proxyURL string, timeout time.Duration) (ipResult, error) {
 	transport, mode, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
 	if errBuild != nil {
@@ -319,8 +361,10 @@ func queryIPApiCom(ctx context.Context, client *http.Client) (ipResult, bool) {
 		Hosting bool   `json:"hosting"`
 		Proxy   bool   `json:"proxy"`
 	}
-	// Request the hosting/proxy fields explicitly via the fields bitmask.
-	if !fetchJSON(ctx, client, "http://ip-api.com/json/?fields=status,query,isp,org,hosting,proxy", &payload) || payload.Query == "" {
+	// Request the hosting/proxy fields explicitly. A failed query still echoes a
+	// non-empty "query", so we must gate on status=="success" too — otherwise a
+	// failure (missing hosting/proxy fields default to false) is read as a clean IP.
+	if !fetchJSON(ctx, client, "https://ip-api.com/json/?fields=status,query,isp,org,hosting,proxy", &payload) || payload.Query == "" || payload.Status != "success" {
 		return ipResult{}, false
 	}
 	isp := payload.ISP
@@ -344,9 +388,14 @@ func queryIPInfo(ctx context.Context, client *http.Client) (ipResult, bool) {
 	if !fetchJSON(ctx, client, "https://ipinfo.io/json", &payload) || payload.IP == "" {
 		return ipResult{}, false
 	}
-	// ipinfo gives no explicit datacenter flag; flag obvious hosting hostnames.
+	// ipinfo gives no explicit datacenter flag; only flag unambiguous hosting
+	// hostnames. "cloud" is deliberately excluded: it matches far too many
+	// legitimate residential PTR records and provider names (icloud, cloudflare,
+	// ISP "cloudnet" reverse DNS), and a single weak signal here would block a
+	// clean IP in strict mode via the OR-merge. Authoritative datacenter/hosting
+	// detection is left to ipapi.is and ip-api.com.
 	host := strings.ToLower(payload.Hostname)
-	suspect := strings.Contains(host, "datacenter") || strings.Contains(host, "hosting") || strings.Contains(host, "cloud")
+	suspect := strings.Contains(host, "datacenter") || strings.Contains(host, "hosting")
 	return ipResult{
 		ip:           payload.IP,
 		isDatacenter: suspect,

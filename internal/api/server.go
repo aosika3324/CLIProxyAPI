@@ -1584,7 +1584,9 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	if oldCfg == nil || oldCfg.TransientErrorCooldownSeconds != cfg.TransientErrorCooldownSeconds {
 		auth.SetTransientErrorCooldownSeconds(cfg.TransientErrorCooldownSeconds)
 	}
-	applyAntiBanConfig(cfg)
+	if oldCfg == nil || oldCfg.AntiBan != cfg.AntiBan {
+		applyAntiBanConfig(cfg)
+	}
 
 	if oldCfg != nil && oldCfg.DisableImageGeneration != cfg.DisableImageGeneration {
 		log.Infof("disable-image-generation updated: %v -> %v", oldCfg.DisableImageGeneration, cfg.DisableImageGeneration)

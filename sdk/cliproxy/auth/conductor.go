@@ -2302,8 +2302,12 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				return cliproxyexecutor.Response{}, errGate
 			}
-			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
-			release()
+			// Release via defer so a panic in Execute cannot leak the slot (which,
+			// under limit=1, would make the credential permanently unavailable).
+			resp, errExec := func() (cliproxyexecutor.Response, error) {
+				defer release()
+				return executor.Execute(execCtx, auth, execReq, execOpts)
+			}()
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {

@@ -67,13 +67,14 @@ type AntiBanIPCheck struct {
 	TimeoutSeconds int `yaml:"timeout-seconds" json:"timeout-seconds"`
 
 	// StrictDatacenter, when true, marks a Claude credential unavailable if its
-	// egress IP is detected as a datacenter/hosting IP (the document's "机房IP必被封"
-	// rule). When false the result is only logged as a warning.
+	// egress IP is detected as a datacenter/hosting IP (the deployment guide's
+	// "datacenter IPs always get banned" rule). When false the result is only
+	// logged as a warning.
 	StrictDatacenter bool `yaml:"strict-datacenter" json:"strict-datacenter"`
 
 	// WarnSharedEgress, when true (default when IPCheck.Enabled), logs a warning
-	// when more than one credential resolves to the same egress IP (the document's
-	// "一个IP多个号=判定共享" rule).
+	// when more than one credential resolves to the same egress IP (the deployment
+	// guide's "one IP, many accounts = detected as account sharing" rule).
 	WarnSharedEgress bool `yaml:"warn-shared-egress" json:"warn-shared-egress"`
 }
 

@@ -312,49 +312,54 @@ func TestAntiBanGateConcurrentResize(t *testing.T) {
 	wg.Wait()
 }
 
-// TestMinIntervalSpacingHoldsUnderConcurrency proves the spacing reservation is
-// atomic: with min-interval set and concurrency > 1, N dispatches on the same
-// auth are still spaced ~interval apart (TOCTOU would let them all fire at once).
-func TestMinIntervalSpacingHoldsUnderConcurrency(t *testing.T) {
+// TestMinIntervalSpacingSerialized verifies spacing under the recommended
+// anti-ban config (maxConcurrent=1): the semaphore serializes requests, so each
+// reserve() sees the prior dispatch and spaces the next one by ~interval.
+func TestMinIntervalSpacingSerialized(t *testing.T) {
 	resetAntiBan()
 	defer resetAntiBan()
 
 	const interval = 40 // ms
-	// concurrency 5 (so the gate does not serialize), min-interval 40ms, no jitter.
-	SetAntiBanConfig(true, 5, 0, 0, 0, interval, false)
+	SetAntiBanConfig(true, 1, 0, 0, 0, interval, false)
 
 	const n = 4
 	times := make([]time.Time, n)
-	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			rel, _, err := acquireAntiBanSlot(context.Background(), "spaced-auth")
-			if err != nil {
-				t.Errorf("acquire failed: %v", err)
-				return
-			}
-			times[idx] = time.Now()
-			rel()
-		}(i)
-	}
-	wg.Wait()
-
-	// Sort dispatch times and assert consecutive gaps are at least most of the
-	// interval (allow scheduler slack).
-	for i := 0; i < n; i++ {
-		for j := i + 1; j < n; j++ {
-			if times[j].Before(times[i]) {
-				times[i], times[j] = times[j], times[i]
-			}
+		rel, _, err := acquireAntiBanSlot(context.Background(), "spaced-auth")
+		if err != nil {
+			t.Fatalf("acquire %d failed: %v", i, err)
 		}
+		times[i] = time.Now()
+		rel()
 	}
+
 	minGap := time.Duration(interval-10) * time.Millisecond
 	for i := 1; i < n; i++ {
 		gap := times[i].Sub(times[i-1])
 		if gap < minGap {
-			t.Fatalf("dispatch %d-%d spaced only %v, expected >= %v (spacing not enforced under concurrency)", i-1, i, gap, minGap)
+			t.Fatalf("dispatch %d-%d spaced only %v, expected >= %v (serialized spacing not enforced)", i-1, i, gap, minGap)
+		}
+	}
+}
+
+// TestReserveWaitIsBounded proves the reserve() cap: even under a burst far faster
+// than the interval (concurrency > 1), no single caller waits more than ~one
+// interval, so queued latency cannot grow without bound and exceed client timeouts.
+func TestReserveWaitIsBounded(t *testing.T) {
+	resetAntiBan()
+	defer resetAntiBan()
+
+	const intervalMS = 50
+	SetAntiBanConfig(true, 50, 0, 0, 0, intervalMS, false)
+
+	g, _ := antiBan.gateFor("burst-auth", 50)
+	s := antiBan.settings.load()
+
+	// Hammer reserve() and assert each returned wait is capped near one interval.
+	maxAllowed := time.Duration(intervalMS+20) * time.Millisecond
+	for i := 0; i < 100; i++ {
+		if wait := g.reserve(s); wait > maxAllowed {
+			t.Fatalf("call %d reserved wait %v exceeds cap %v (unbounded growth)", i, wait, maxAllowed)
 		}
 	}
 }

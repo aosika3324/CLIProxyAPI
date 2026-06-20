@@ -42,6 +42,7 @@ const (
 	blockReasonDisabled
 	blockReasonOther
 	blockReasonRequireProxy
+	blockReasonDatacenterBlocked
 )
 
 type modelCooldownError struct {
@@ -320,7 +321,7 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	// detected as a datacenter/hosting IP is held out of rotation until the next
 	// successful check clears it.
 	if antiBanDatacenterBlocked(auth.ID) {
-		return true, blockReasonRequireProxy, time.Time{}
+		return true, blockReasonDatacenterBlocked, time.Time{}
 	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {

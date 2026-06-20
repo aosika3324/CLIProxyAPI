@@ -107,6 +107,13 @@ type Service struct {
 	homeClient       *home.Client
 	homeCancel       context.CancelFunc
 	homeLogForwarder *logging.HomeAppLogForwarder
+
+	// antiBanChecker runs the optional egress IP self-check. It is created lazily
+	// and (re)started idempotently on startup and on config hot reload.
+	antiBanChecker *antiban.Checker
+	// antiBanRunCtx is the long-lived run context used to (re)start the checker
+	// from the reload path, which has no request context of its own.
+	antiBanRunCtx context.Context
 }
 
 const modelRegistrationMaxWorkersPerCategory = 5
@@ -1243,6 +1250,15 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 		}
 	}
 	s.syncPluginRuntime(ctx)
+
+	// (Re)start the egress IP self-check if a hot reload just enabled it (or a
+	// prior one-shot pass has finished). Idempotent while already running.
+	s.cfgMu.RLock()
+	runCtx := s.antiBanRunCtx
+	s.cfgMu.RUnlock()
+	if runCtx != nil {
+		s.ensureAntiBanIPChecker(runCtx)
+	}
 }
 
 func (s *Service) reloadConfigFromWatcher() bool {
@@ -1465,36 +1481,42 @@ func (s *Service) startHomeSubscriber(ctx context.Context) {
 // Returns:
 //   - error: An error if the service fails to start or run
 //
-// startAntiBanIPCheck launches the egress IP self-check when enabled in config.
-// It is a no-op otherwise. The checker reads the live config on each pass so
-// hot-reloads of the anti-ban block take effect without a restart.
-func (s *Service) startAntiBanIPCheck(ctx context.Context) {
-	if s == nil || s.coreManager == nil {
+// ensureAntiBanIPChecker lazily builds the egress IP self-check and (re)starts it
+// if the feature is enabled. It is called on startup and on every config hot
+// reload: Checker.Start is idempotent, so a late enable (or a one-shot pass that
+// has finished) restarts the loop while an already-running loop is left alone. The
+// checker reads the live config on each pass, so toggles take effect without a
+// restart. ctx must be a long-lived context (the run context) so the loop is not
+// tied to a single reload.
+func (s *Service) ensureAntiBanIPChecker(ctx context.Context) {
+	if s == nil || s.coreManager == nil || ctx == nil {
 		return
 	}
-	lister := func() []antiban.AuthSnapshot {
-		auths := s.coreManager.List()
-		out := make([]antiban.AuthSnapshot, 0, len(auths))
-		for _, a := range auths {
-			if a == nil {
-				continue
+	if s.antiBanChecker == nil {
+		lister := func() []antiban.AuthSnapshot {
+			auths := s.coreManager.List()
+			out := make([]antiban.AuthSnapshot, 0, len(auths))
+			for _, a := range auths {
+				if a == nil {
+					continue
+				}
+				out = append(out, antiban.AuthSnapshot{
+					ID:       a.ID,
+					Label:    a.Label,
+					Provider: a.Provider,
+					ProxyURL: a.ProxyURL,
+				})
 			}
-			out = append(out, antiban.AuthSnapshot{
-				ID:       a.ID,
-				Label:    a.Label,
-				Provider: a.Provider,
-				ProxyURL: a.ProxyURL,
-			})
+			return out
 		}
-		return out
+		getCfg := func() *config.Config {
+			s.cfgMu.RLock()
+			defer s.cfgMu.RUnlock()
+			return s.cfg
+		}
+		s.antiBanChecker = antiban.NewChecker(lister, getCfg, coreauth.SetDatacenterBlockedAuths, coreauth.GetDatacenterBlockedAuths)
 	}
-	getCfg := func() *config.Config {
-		s.cfgMu.RLock()
-		defer s.cfgMu.RUnlock()
-		return s.cfg
-	}
-	checker := antiban.NewChecker(lister, getCfg, coreauth.SetDatacenterBlockedAuths)
-	checker.Start(ctx)
+	s.antiBanChecker.Start(ctx)
 }
 
 func (s *Service) Run(ctx context.Context) error {
@@ -1662,8 +1684,12 @@ func (s *Service) Run(ctx context.Context) error {
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
 	}
 
-	// Anti-ban egress IP self-check (opt-in via config).
-	s.startAntiBanIPCheck(ctx)
+	// Anti-ban egress IP self-check (opt-in via config). Capture the run context
+	// so the reload path can (re)start the checker on a late enable.
+	s.cfgMu.Lock()
+	s.antiBanRunCtx = ctx
+	s.cfgMu.Unlock()
+	s.ensureAntiBanIPChecker(ctx)
 
 	select {
 	case <-ctx.Done():

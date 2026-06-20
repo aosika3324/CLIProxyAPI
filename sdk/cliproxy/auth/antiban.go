@@ -109,6 +109,23 @@ func antiBanDatacenterBlocked(authID string) bool {
 	return ok
 }
 
+// GetDatacenterBlockedAuths returns the auth IDs currently blocked by the egress
+// IP self-check strict mode. The egress checker uses it to preserve existing
+// blocks across passes where a credential's lookup transiently fails (so a single
+// network hiccup cannot silently restore a known datacenter-egress credential).
+func GetDatacenterBlockedAuths() []string {
+	datacenterBlocked.mu.RLock()
+	defer datacenterBlocked.mu.RUnlock()
+	if len(datacenterBlocked.ids) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(datacenterBlocked.ids))
+	for id := range datacenterBlocked.ids {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 // SetAntiBanConfig installs the active anti-ban dispatch settings. Passing values
 // that disable every control (or enabled=false) reverts to upstream behavior.
 // concurrencyWaitMS <= 0 waits indefinitely for a free slot (bounded only by ctx).
@@ -260,6 +277,12 @@ func acquireSem(ctx context.Context, sem chan struct{}, wait time.Duration) erro
 // lastDispatch is advanced to the reserved target under the lock, so two
 // goroutines can never reserve the same slot. A cancelled caller leaves its
 // reservation in place, which only makes subsequent spacing more conservative.
+//
+// The reserved slot is capped at now+minInterval: under a burst arriving faster
+// than the interval, queued latency would otherwise grow without bound (the Nth
+// caller waiting N*interval), eventually exceeding client timeouts. Capping trades
+// strict spacing under burst (concurrent callers may share a slot) for bounded
+// latency, which is the right call for a throttle.
 func (g *antiBanGate) reserve(s *antiBanSettings) time.Duration {
 	now := time.Now()
 	jitter := randomJitter(s.jitterMin, s.jitterMax)
@@ -271,6 +294,10 @@ func (g *antiBanGate) reserve(s *antiBanSettings) time.Duration {
 	if s.minInterval > 0 && !g.lastDispatch.IsZero() {
 		if candidate := g.lastDispatch.Add(s.minInterval); candidate.After(earliest) {
 			earliest = candidate
+		}
+		// Cap so a sustained burst cannot push the reservation unboundedly ahead.
+		if maxAhead := now.Add(s.minInterval); earliest.After(maxAhead) {
+			earliest = maxAhead
 		}
 	}
 	target := earliest.Add(jitter)
