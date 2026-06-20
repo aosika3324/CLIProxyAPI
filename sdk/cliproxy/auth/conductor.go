@@ -1552,6 +1552,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			// Anti-ban: gate per-auth concurrency and apply rhythm jitter before dispatch.
 			release, holdsSlot, errGate := acquireAntiBanSlot(ctx, auth.ID)
 			if errGate != nil {
+				// Both busy-timeout and ctx errors stop this credential. Returning
+				// the error lets executeStreamMixedOnce fail over to the next
+				// credential (busy) or abort (ctx cancelled); we must not loop the
+				// model list on the same auth and re-wait the timeout per model.
 				loopReturn = true
 				loopErr = errGate
 				return
@@ -2290,6 +2294,12 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			// Anti-ban: gate per-auth concurrency and apply rhythm jitter before dispatch.
 			release, _, errGate := acquireAntiBanSlot(execCtx, auth.ID)
 			if errGate != nil {
+				if errors.Is(errGate, errAntiBanBusy) {
+					// This credential is at its concurrency cap; fail over to the
+					// next one (it is already in `tried`, so it won't be reselected).
+					authErr = errGate
+					break
+				}
 				return cliproxyexecutor.Response{}, errGate
 			}
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)

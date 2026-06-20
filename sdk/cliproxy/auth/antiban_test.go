@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -139,6 +140,31 @@ func TestAcquireAntiBanSlotWaitTimeout(t *testing.T) {
 	_, _, err = acquireAntiBanSlot(context.Background(), "auth-1")
 	if err == nil {
 		t.Fatal("expected timeout error when slot unavailable past wait window")
+	}
+	if !errors.Is(err, errAntiBanBusy) {
+		t.Fatalf("wait timeout must return errAntiBanBusy (for failover), got %v", err)
+	}
+}
+
+func TestAcquireAntiBanSlotContextCancelNotBusy(t *testing.T) {
+	resetAntiBan()
+	SetAntiBanConfig(true, 1, 0, 0, 0, 0, false)
+	defer resetAntiBan()
+
+	rel1, _, err := acquireAntiBanSlot(context.Background(), "auth-cc")
+	if err != nil {
+		t.Fatalf("first acquire failed: %v", err)
+	}
+	defer rel1()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err = acquireAntiBanSlot(ctx, "auth-cc")
+	if err == nil {
+		t.Fatal("expected error on cancelled context")
+	}
+	if errors.Is(err, errAntiBanBusy) {
+		t.Fatal("context cancellation must NOT be reported as busy (must abort, not failover)")
 	}
 }
 
@@ -284,4 +310,51 @@ func TestAntiBanGateConcurrentResize(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// TestMinIntervalSpacingHoldsUnderConcurrency proves the spacing reservation is
+// atomic: with min-interval set and concurrency > 1, N dispatches on the same
+// auth are still spaced ~interval apart (TOCTOU would let them all fire at once).
+func TestMinIntervalSpacingHoldsUnderConcurrency(t *testing.T) {
+	resetAntiBan()
+	defer resetAntiBan()
+
+	const interval = 40 // ms
+	// concurrency 5 (so the gate does not serialize), min-interval 40ms, no jitter.
+	SetAntiBanConfig(true, 5, 0, 0, 0, interval, false)
+
+	const n = 4
+	times := make([]time.Time, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			rel, _, err := acquireAntiBanSlot(context.Background(), "spaced-auth")
+			if err != nil {
+				t.Errorf("acquire failed: %v", err)
+				return
+			}
+			times[idx] = time.Now()
+			rel()
+		}(i)
+	}
+	wg.Wait()
+
+	// Sort dispatch times and assert consecutive gaps are at least most of the
+	// interval (allow scheduler slack).
+	for i := 0; i < n; i++ {
+		for j := i + 1; j < n; j++ {
+			if times[j].Before(times[i]) {
+				times[i], times[j] = times[j], times[i]
+			}
+		}
+	}
+	minGap := time.Duration(interval-10) * time.Millisecond
+	for i := 1; i < n; i++ {
+		gap := times[i].Sub(times[i-1])
+		if gap < minGap {
+			t.Fatalf("dispatch %d-%d spaced only %v, expected >= %v (spacing not enforced under concurrency)", i-1, i, gap, minGap)
+		}
+	}
 }

@@ -2,12 +2,19 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"math/rand"
 	"sync"
 	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
+
+// errAntiBanBusy is returned by acquireAntiBanSlot when the per-auth concurrency
+// slot could not be obtained within concurrency-wait-timeout-ms. It is distinct
+// from context cancellation (client disconnect): a busy credential should fail
+// over to the next one, whereas a cancelled context aborts the whole request.
+var errAntiBanBusy = errors.New("anti-ban: per-auth concurrency slot busy")
 
 // antiBanSettings is an immutable snapshot of the anti-ban controls relevant to
 // request dispatch. It is swapped atomically via SetAntiBanConfig so the hot path
@@ -196,8 +203,10 @@ func acquireAntiBanSlot(ctx context.Context, authID string) (antiBanRelease, boo
 		}
 	}
 
-	// Step 2: spacing + jitter. On cancellation, release the slot we hold.
-	if wait := g.nextWait(s); wait > 0 {
+	// Step 2: spacing + jitter. reserve() atomically claims this dispatch's time
+	// slot so min-interval spacing holds even with concurrency > 1. On
+	// cancellation, release the concurrency slot we hold.
+	if wait := g.reserve(s); wait > 0 {
 		timer := time.NewTimer(wait)
 		select {
 		case <-timer.C:
@@ -207,7 +216,6 @@ func acquireAntiBanSlot(ctx context.Context, authID string) (antiBanRelease, boo
 			return func() {}, false, ctx.Err()
 		}
 	}
-	g.markDispatch()
 	return release, holdsSlot, nil
 }
 
@@ -236,35 +244,43 @@ func acquireSem(ctx context.Context, sem chan struct{}, wait time.Duration) erro
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-timer.C:
-		return context.DeadlineExceeded
+		return errAntiBanBusy
 	}
 }
 
 // nextWait computes the pre-dispatch delay combining min-interval spacing (time
 // still owed since the previous dispatch) and a random jitter in [min, max].
-func (g *antiBanGate) nextWait(s *antiBanSettings) time.Duration {
-	var spacing time.Duration
-	if s.minInterval > 0 {
-		g.clockMu.Lock()
-		last := g.lastDispatch
-		g.clockMu.Unlock()
-		if !last.IsZero() {
-			if elapsed := time.Since(last); elapsed < s.minInterval {
-				spacing = s.minInterval - elapsed
-			}
+// reserve atomically claims the next dispatch time slot for this credential and
+// returns how long the caller must wait before dispatching. It combines:
+//   - min-interval spacing: the slot is no earlier than lastDispatch + interval,
+//     so concurrent callers each reserve a distinct future slot (the spacing
+//     holds even with concurrency > 1, not just when requests serialize), and
+//   - jitter: an independent random delay added on top of the spacing baseline.
+//
+// lastDispatch is advanced to the reserved target under the lock, so two
+// goroutines can never reserve the same slot. A cancelled caller leaves its
+// reservation in place, which only makes subsequent spacing more conservative.
+func (g *antiBanGate) reserve(s *antiBanSettings) time.Duration {
+	now := time.Now()
+	jitter := randomJitter(s.jitterMin, s.jitterMax)
+
+	g.clockMu.Lock()
+	defer g.clockMu.Unlock()
+
+	earliest := now
+	if s.minInterval > 0 && !g.lastDispatch.IsZero() {
+		if candidate := g.lastDispatch.Add(s.minInterval); candidate.After(earliest) {
+			earliest = candidate
 		}
 	}
-	jitter := randomJitter(s.jitterMin, s.jitterMax)
-	if spacing > jitter {
-		return spacing
-	}
-	return jitter
-}
+	target := earliest.Add(jitter)
+	g.lastDispatch = target
 
-func (g *antiBanGate) markDispatch() {
-	g.clockMu.Lock()
-	g.lastDispatch = time.Now()
-	g.clockMu.Unlock()
+	wait := time.Until(target)
+	if wait < 0 {
+		wait = 0
+	}
+	return wait
 }
 
 // randomJitter returns a random duration in [min, max]. When max <= 0 it returns

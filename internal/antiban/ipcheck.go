@@ -117,6 +117,10 @@ func (c *Checker) RunOnce(ctx context.Context) {
 	if timeout <= 0 {
 		timeout = defaultIPCheckTimeout
 	}
+	// Global proxy fallback, mirroring NewUtlsHTTPClient: real traffic uses
+	// auth.ProxyURL when set, otherwise cfg.ProxyURL. The check must probe the
+	// same effective egress or its verdict would not reflect reality.
+	globalProxy := strings.TrimSpace(cfg.ProxyURL)
 
 	auths := c.lister()
 	findings := make([]egressFinding, 0, len(auths))
@@ -124,12 +128,16 @@ func (c *Checker) RunOnce(ctx context.Context) {
 		if !strings.EqualFold(strings.TrimSpace(a.Provider), "claude") {
 			continue
 		}
-		proxyURL := strings.TrimSpace(a.ProxyURL)
 		name := authDisplayName(a)
+		// Effective egress = per-auth proxy, else global proxy (same precedence
+		// as the request path). Only when BOTH are empty does traffic leave on the
+		// server's bare IP.
+		proxyURL := strings.TrimSpace(a.ProxyURL)
 		if proxyURL == "" {
-			// Without a proxy the egress is the server's bare IP; require-proxy
-			// (a separate control) handles eligibility. Here we just note it.
-			log.Warnf("anti-ban ip-check: credential %s has no proxy-url; egress would use the server IP", name)
+			proxyURL = globalProxy
+		}
+		if proxyURL == "" {
+			log.Warnf("anti-ban ip-check: credential %s has no per-auth or global proxy-url; egress would use the server IP", name)
 			continue
 		}
 		result, errCheck := lookupEgress(ctx, proxyURL, timeout)
