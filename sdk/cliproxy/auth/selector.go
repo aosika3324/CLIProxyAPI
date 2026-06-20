@@ -41,6 +41,7 @@ const (
 	blockReasonCooldown
 	blockReasonDisabled
 	blockReasonOther
+	blockReasonRequireProxy
 )
 
 type modelCooldownError struct {
@@ -308,6 +309,18 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	}
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
+	}
+	// Anti-ban account<->proxy binding: a Claude credential without a per-auth
+	// proxy would egress on the server's bare IP, so it is ineligible while
+	// require-proxy is enabled. Other providers are unaffected.
+	if antiBanRequireProxy() && strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") && strings.TrimSpace(auth.ProxyURL) == "" {
+		return true, blockReasonRequireProxy, time.Time{}
+	}
+	// Anti-ban egress IP self-check (strict mode): a credential whose egress IP was
+	// detected as a datacenter/hosting IP is held out of rotation until the next
+	// successful check clears it.
+	if antiBanDatacenterBlocked(auth.ID) {
+		return true, blockReasonRequireProxy, time.Time{}
 	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {

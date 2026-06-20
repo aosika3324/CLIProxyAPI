@@ -1534,88 +1534,136 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	ctx = contextWithRequestedModelAlias(ctx, opts, routeModel)
 	var lastErr error
 	for idx, execModel := range execModels {
-		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
-		execReq := req
-		execReq.Model = execModel
-		execOpts := opts
-		execReq, execOpts = applyRequestAfterAuthInterceptor(ctx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
-		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
-		if errStream != nil {
-			if errCtx := ctx.Err(); errCtx != nil {
-				return nil, errCtx
+		// Each model attempt runs in its own scope so the anti-ban concurrency
+		// slot is released via defer on every failure/retry path, while the
+		// success path transfers slot ownership to the streamed channel.
+		var (
+			loopResult *cliproxyexecutor.StreamResult
+			loopReturn bool  // when true, return (loopResult, loopErr) immediately
+			loopErr    error // terminal error paired with loopReturn
+			loopRetry  error // when non-nil, set lastErr and continue to next model
+		)
+		func() {
+			resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
+			execReq := req
+			execReq.Model = execModel
+			execOpts := opts
+			execReq, execOpts = applyRequestAfterAuthInterceptor(ctx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+			// Anti-ban: gate per-auth concurrency and apply rhythm jitter before dispatch.
+			release, errGate := acquireAntiBanSlot(ctx, auth.ID)
+			if errGate != nil {
+				loopReturn = true
+				loopErr = errGate
+				return
 			}
-			rerr := &Error{Message: errStream.Error()}
-			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
-				rerr.HTTPStatus = se.StatusCode()
+			slotHeld := true
+			defer func() {
+				if slotHeld {
+					release()
+				}
+			}()
+			streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
+			if errStream != nil {
+				if errCtx := ctx.Err(); errCtx != nil {
+					loopReturn = true
+					loopErr = errCtx
+					return
+				}
+				rerr := &Error{Message: errStream.Error()}
+				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
+					rerr.HTTPStatus = se.StatusCode()
+				}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+				result.RetryAfter = retryAfterFromError(errStream)
+				m.MarkResult(ctx, result)
+				if isRequestInvalidError(errStream) {
+					loopReturn = true
+					loopErr = errStream
+					return
+				}
+				loopRetry = errStream
+				return
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
-			result.RetryAfter = retryAfterFromError(errStream)
-			m.MarkResult(ctx, result)
-			if isRequestInvalidError(errStream) {
-				return nil, errStream
+
+			buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
+			if bootstrapErr != nil {
+				if errCtx := ctx.Err(); errCtx != nil {
+					discardStreamChunks(streamResult.Chunks)
+					loopReturn = true
+					loopErr = errCtx
+					return
+				}
+				if isRequestInvalidError(bootstrapErr) {
+					rerr := &Error{Message: bootstrapErr.Error()}
+					if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
+						rerr.HTTPStatus = se.StatusCode()
+					}
+					result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+					result.RetryAfter = retryAfterFromError(bootstrapErr)
+					m.MarkResult(ctx, result)
+					discardStreamChunks(streamResult.Chunks)
+					loopReturn = true
+					loopErr = bootstrapErr
+					return
+				}
+				if idx < len(execModels)-1 {
+					rerr := &Error{Message: bootstrapErr.Error()}
+					if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
+						rerr.HTTPStatus = se.StatusCode()
+					}
+					result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+					result.RetryAfter = retryAfterFromError(bootstrapErr)
+					m.MarkResult(ctx, result)
+					discardStreamChunks(streamResult.Chunks)
+					loopRetry = bootstrapErr
+					return
+				}
+				rerr := &Error{Message: bootstrapErr.Error()}
+				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
+					rerr.HTTPStatus = se.StatusCode()
+				}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+				result.RetryAfter = retryAfterFromError(bootstrapErr)
+				m.MarkResult(ctx, result)
+				discardStreamChunks(streamResult.Chunks)
+				loopReturn = true
+				loopErr = newStreamBootstrapError(bootstrapErr, streamResult.Headers)
+				return
 			}
-			lastErr = errStream
+
+			if closed && len(buffered) == 0 {
+				emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
+				m.MarkResult(ctx, result)
+				if idx < len(execModels)-1 {
+					loopRetry = emptyErr
+					return
+				}
+				loopReturn = true
+				loopErr = newStreamBootstrapError(emptyErr, streamResult.Headers)
+				return
+			}
+
+			remaining := streamResult.Chunks
+			if closed {
+				closedCh := make(chan cliproxyexecutor.StreamChunk)
+				close(closedCh)
+				remaining = closedCh
+			}
+			// Success: transfer slot ownership to the streamed channel so the slot
+			// stays held for the whole response, released when the stream drains.
+			slotHeld = false
+			wrapped := m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining)
+			loopResult = wrapStreamReleaseOnDrain(ctx, wrapped, release)
+			loopReturn = true
+		}()
+		if loopReturn {
+			return loopResult, loopErr
+		}
+		if loopRetry != nil {
+			lastErr = loopRetry
 			continue
 		}
-
-		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
-		if bootstrapErr != nil {
-			if errCtx := ctx.Err(); errCtx != nil {
-				discardStreamChunks(streamResult.Chunks)
-				return nil, errCtx
-			}
-			if isRequestInvalidError(bootstrapErr) {
-				rerr := &Error{Message: bootstrapErr.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-					rerr.HTTPStatus = se.StatusCode()
-				}
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
-				result.RetryAfter = retryAfterFromError(bootstrapErr)
-				m.MarkResult(ctx, result)
-				discardStreamChunks(streamResult.Chunks)
-				return nil, bootstrapErr
-			}
-			if idx < len(execModels)-1 {
-				rerr := &Error{Message: bootstrapErr.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-					rerr.HTTPStatus = se.StatusCode()
-				}
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
-				result.RetryAfter = retryAfterFromError(bootstrapErr)
-				m.MarkResult(ctx, result)
-				discardStreamChunks(streamResult.Chunks)
-				lastErr = bootstrapErr
-				continue
-			}
-			rerr := &Error{Message: bootstrapErr.Error()}
-			if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-				rerr.HTTPStatus = se.StatusCode()
-			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
-			result.RetryAfter = retryAfterFromError(bootstrapErr)
-			m.MarkResult(ctx, result)
-			discardStreamChunks(streamResult.Chunks)
-			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
-		}
-
-		if closed && len(buffered) == 0 {
-			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
-			m.MarkResult(ctx, result)
-			if idx < len(execModels)-1 {
-				lastErr = emptyErr
-				continue
-			}
-			return nil, newStreamBootstrapError(emptyErr, streamResult.Headers)
-		}
-
-		remaining := streamResult.Chunks
-		if closed {
-			closedCh := make(chan cliproxyexecutor.StreamChunk)
-			close(closedCh)
-			remaining = closedCh
-		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -2231,7 +2279,13 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execReq.Model = upstreamModel
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+			// Anti-ban: gate per-auth concurrency and apply rhythm jitter before dispatch.
+			release, errGate := acquireAntiBanSlot(execCtx, auth.ID)
+			if errGate != nil {
+				return cliproxyexecutor.Response{}, errGate
+			}
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
+			release()
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {

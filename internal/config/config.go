@@ -108,6 +108,11 @@ type Config struct {
 	// WebsocketAuth enables or disables authentication for the WebSocket API.
 	WebsocketAuth bool `yaml:"ws-auth" json:"ws-auth"`
 
+	// AntiBan groups Claude anti-ban controls (per-account concurrency limiting,
+	// request-rhythm jitter, account<->proxy binding, egress IP self-check).
+	// Opt-in: a zero value preserves upstream behavior.
+	AntiBan AntiBan `yaml:"anti-ban" json:"anti-ban"`
+
 	// AntigravitySignatureCacheEnabled controls whether signature cache validation is enabled for thinking blocks.
 	// When true (default), cached signatures are preferred and validated.
 	// When false, client signatures are used directly after normalization (bypass mode).
@@ -781,6 +786,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
+
+	// Clamp anti-ban controls into sane ranges.
+	cfg.NormalizeAntiBan()
 
 	// Return the populated configuration struct.
 	return &cfg, nil

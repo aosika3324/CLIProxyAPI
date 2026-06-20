@@ -127,6 +127,54 @@ save-cooldown-status: false
 # Set to 0 to keep the legacy 60-second cooldown; set to -1 to disable transient error cooldowns.
 transient-error-cooldown-seconds: 0
 
+# ----------------------------------------------------------------------------
+# Anti-ban controls (Claude account hygiene).
+#
+# The Claude executor already disguises every request as the genuine Claude Code
+# CLI (Beta headers, billing header, User-Agent, session id). This block adds
+# account-level hygiene on top, mapping the residential-IP deployment playbook
+# into the gateway. The whole block is opt-in: with enabled=false nothing changes.
+anti-ban:
+  enabled: false
+
+  # Max in-flight requests per credential. 1 mirrors "one terminal at a time" and
+  # avoids the script-like burst pattern that gets accounts flagged. 0 = unlimited.
+  max-concurrent-per-auth: 1
+
+  # How long a request waits for a free per-auth slot before failing. This wait
+  # happens before any upstream connection, so it is not an upstream timeout.
+  # 0 waits until a slot frees or the client disconnects.
+  concurrency-wait-timeout-ms: 0
+
+  # Random pre-dispatch delay in [min,max] ms to break up robotic timing.
+  # Both 0 disables jitter. Adds latency, so keep it small.
+  jitter-min-ms: 0
+  jitter-max-ms: 0
+
+  # Minimum spacing in ms between two consecutive dispatches on the same
+  # credential. 0 disables. Stacks with jitter (the larger wins).
+  min-request-interval-ms: 0
+
+  # When true, a Claude credential without its own proxy-url is held out of
+  # rotation so it can never leak the server's real IP. Other providers ignore this.
+  require-proxy: false
+
+  # Egress IP self-check: routes each credential's proxy through public IP
+  # reputation databases (ipapi.is / ip-api.com / ipinfo.io) and warns on
+  # datacenter/hosting IPs or several credentials sharing one egress IP.
+  ip-check:
+    enabled: false
+    # Re-run on a timer; 0 = run once at startup only.
+    interval-minutes: 0
+    # Per-lookup timeout (diagnostic probe; never carries provider traffic). 0 = 10s.
+    timeout-seconds: 10
+    # When true, hold credentials with datacenter egress IPs out of rotation
+    # (otherwise the result is only logged).
+    strict-datacenter: false
+    # When true, warn when more than one credential resolves to the same egress IP.
+    warn-shared-egress: true
+# ----------------------------------------------------------------------------
+
 # When true, globally disable Claude request cloaking (the Claude Code CLI disguise and
 # system prompt replacement), so the original system prompt is passed through to Claude as-is.
 # Individual credentials can still override this: a claude-api-key entry via its "cloak.mode",

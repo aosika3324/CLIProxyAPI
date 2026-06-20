@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/antiban"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
@@ -1463,6 +1464,39 @@ func (s *Service) startHomeSubscriber(ctx context.Context) {
 //
 // Returns:
 //   - error: An error if the service fails to start or run
+//
+// startAntiBanIPCheck launches the egress IP self-check when enabled in config.
+// It is a no-op otherwise. The checker reads the live config on each pass so
+// hot-reloads of the anti-ban block take effect without a restart.
+func (s *Service) startAntiBanIPCheck(ctx context.Context) {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	lister := func() []antiban.AuthSnapshot {
+		auths := s.coreManager.List()
+		out := make([]antiban.AuthSnapshot, 0, len(auths))
+		for _, a := range auths {
+			if a == nil {
+				continue
+			}
+			out = append(out, antiban.AuthSnapshot{
+				ID:       a.ID,
+				Label:    a.Label,
+				Provider: a.Provider,
+				ProxyURL: a.ProxyURL,
+			})
+		}
+		return out
+	}
+	getCfg := func() *config.Config {
+		s.cfgMu.RLock()
+		defer s.cfgMu.RUnlock()
+		return s.cfg
+	}
+	checker := antiban.NewChecker(lister, getCfg, coreauth.SetDatacenterBlockedAuths)
+	checker.Start(ctx)
+}
+
 func (s *Service) Run(ctx context.Context) error {
 	if s == nil {
 		return fmt.Errorf("cliproxy: service is nil")
@@ -1627,6 +1661,9 @@ func (s *Service) Run(ctx context.Context) error {
 		s.coreManager.StartAutoRefresh(context.Background(), interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
 	}
+
+	// Anti-ban egress IP self-check (opt-in via config).
+	s.startAntiBanIPCheck(ctx)
 
 	select {
 	case <-ctx.Done():

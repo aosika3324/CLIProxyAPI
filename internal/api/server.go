@@ -329,6 +329,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	managementasset.SetCurrentConfig(cfg)
 	auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 	auth.SetTransientErrorCooldownSeconds(cfg.TransientErrorCooldownSeconds)
+	applyAntiBanConfig(cfg)
 	applySignatureCacheConfig(nil, cfg)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
@@ -1583,6 +1584,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	if oldCfg == nil || oldCfg.TransientErrorCooldownSeconds != cfg.TransientErrorCooldownSeconds {
 		auth.SetTransientErrorCooldownSeconds(cfg.TransientErrorCooldownSeconds)
 	}
+	applyAntiBanConfig(cfg)
 
 	if oldCfg != nil && oldCfg.DisableImageGeneration != cfg.DisableImageGeneration {
 		log.Infof("disable-image-generation updated: %v -> %v", oldCfg.DisableImageGeneration, cfg.DisableImageGeneration)
@@ -1755,6 +1757,26 @@ func applySignatureCacheConfig(oldCfg, cfg *config.Config) {
 	if oldStrict != newStrict {
 		cache.SetSignatureBypassStrictMode(newStrict)
 	}
+}
+
+// applyAntiBanConfig installs the anti-ban dispatch controls (per-account
+// concurrency, rhythm jitter, account<->proxy binding) from the active config.
+// Idempotent and safe to call on startup and on every hot reload.
+func applyAntiBanConfig(cfg *config.Config) {
+	if cfg == nil {
+		auth.SetAntiBanConfig(false, 0, 0, 0, 0, 0, false)
+		return
+	}
+	ab := cfg.AntiBan
+	auth.SetAntiBanConfig(
+		ab.Enabled,
+		ab.MaxConcurrentPerAuth,
+		ab.ConcurrencyWaitTimeoutMS,
+		ab.JitterMinMS,
+		ab.JitterMaxMS,
+		ab.MinRequestIntervalMS,
+		ab.RequireProxy,
+	)
 }
 
 func configuredSignatureBypassStrict(cfg *config.Config) bool {
