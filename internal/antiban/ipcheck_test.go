@@ -68,6 +68,7 @@ func TestStartNoopWhenDisabled(t *testing.T) {
 		func() *config.Config { return &config.Config{} }, // AntiBan zero value: disabled
 		func(ids []string) {},
 		func() []string { return nil },
+		nil,
 	)
 	// Should return immediately without spawning anything.
 	c.Start(context.Background())
@@ -127,6 +128,7 @@ func TestRunOnceClearsBlocksWhenDisabled(t *testing.T) {
 		func() *config.Config { return &config.Config{} }, // anti-ban disabled
 		func(ids []string) { blocked = ids },
 		func() []string { return blocked },
+		nil,
 	)
 	c.RunOnce(context.Background())
 	if blocked != nil {

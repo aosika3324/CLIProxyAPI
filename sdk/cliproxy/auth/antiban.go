@@ -97,6 +97,50 @@ func SetDatacenterBlockedAuths(ids []string) {
 	datacenterBlocked.ids = set
 }
 
+// EgressStatus is a read-only snapshot of one credential's last egress self-check
+// result, published for the management API. It is purely informational.
+type EgressStatus struct {
+	AuthID       string `json:"auth_id"`
+	Label        string `json:"label,omitempty"`
+	IP           string `json:"ip,omitempty"`
+	Country      string `json:"country,omitempty"`
+	ISP          string `json:"isp,omitempty"`
+	IsDatacenter bool   `json:"is_datacenter"`
+	Blocked      bool   `json:"blocked"`
+	Source       string `json:"source,omitempty"`
+	CheckedAt    string `json:"checked_at,omitempty"`
+	Error        string `json:"error,omitempty"`
+}
+
+// egressStatus holds the latest egress self-check snapshot for the management API.
+var egressStatus struct {
+	mu   sync.RWMutex
+	list []EgressStatus
+}
+
+// SetEgressStatus publishes the latest egress self-check snapshot. The egress
+// checker calls it after each pass; a nil/empty slice clears it.
+func SetEgressStatus(list []EgressStatus) {
+	egressStatus.mu.Lock()
+	defer egressStatus.mu.Unlock()
+	if len(list) == 0 {
+		egressStatus.list = nil
+		return
+	}
+	egressStatus.list = append(egressStatus.list[:0:0], list...)
+}
+
+// GetEgressStatus returns a copy of the latest egress self-check snapshot for the
+// management API. Returns nil when the self-check has not run or is disabled.
+func GetEgressStatus() []EgressStatus {
+	egressStatus.mu.RLock()
+	defer egressStatus.mu.RUnlock()
+	if len(egressStatus.list) == 0 {
+		return nil
+	}
+	return append([]EgressStatus(nil), egressStatus.list...)
+}
+
 // antiBanDatacenterBlocked reports whether the given auth ID is currently blocked
 // by the egress IP self-check strict mode. It returns false whenever anti-ban is
 // disabled, so toggling the feature off immediately releases any credentials the

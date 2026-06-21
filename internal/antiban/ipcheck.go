@@ -65,12 +65,32 @@ type egressFinding struct {
 	err    error
 }
 
+// StatusEntry is one credential's egress self-check result, published for the
+// management API. It mirrors coreauth.EgressStatus without importing it here.
+type StatusEntry struct {
+	AuthID       string
+	Label        string
+	IP           string
+	Country      string
+	ISP          string
+	IsDatacenter bool
+	Blocked      bool
+	Source       string
+	CheckedAt    string
+	Error        string
+}
+
+// StatusPublisher receives the latest egress snapshot after each pass. It is
+// typically a thin adapter over coreauth.SetEgressStatus.
+type StatusPublisher func([]StatusEntry)
+
 // Checker runs egress IP self-checks on a schedule.
 type Checker struct {
 	lister     AuthLister
 	getCfg     func() *config.Config
 	setBlock   BlockSetter
 	getBlocked BlockGetter
+	publish    StatusPublisher
 
 	// running guards the background loop so Start is idempotent and re-entrant:
 	// it can be called repeatedly (startup + every hot reload) without spawning
@@ -93,10 +113,12 @@ type egressObservation struct {
 
 // NewChecker builds a checker. lister enumerates credentials, getCfg returns the
 // live config (so hot-reloads take effect), setBlock installs strict-mode blocks
-// (may be nil to disable strict enforcement), and getBlocked returns the current
-// block set so transient lookup failures preserve existing blocks (may be nil).
-func NewChecker(lister AuthLister, getCfg func() *config.Config, setBlock BlockSetter, getBlocked BlockGetter) *Checker {
-	return &Checker{lister: lister, getCfg: getCfg, setBlock: setBlock, getBlocked: getBlocked}
+// (may be nil to disable strict enforcement), getBlocked returns the current
+// block set so transient lookup failures preserve existing blocks (may be nil),
+// and publish receives the per-credential status snapshot after each pass for the
+// management API (may be nil).
+func NewChecker(lister AuthLister, getCfg func() *config.Config, setBlock BlockSetter, getBlocked BlockGetter, publish StatusPublisher) *Checker {
+	return &Checker{lister: lister, getCfg: getCfg, setBlock: setBlock, getBlocked: getBlocked, publish: publish}
 }
 
 // Start launches the self-check loop if the feature is enabled and the loop is not
@@ -153,6 +175,9 @@ func (c *Checker) RunOnce(ctx context.Context) {
 		if c.setBlock != nil {
 			c.setBlock(nil)
 		}
+		if c.publish != nil {
+			c.publish(nil)
+		}
 		return
 	}
 	settings := cfg.AntiBan.IPCheck
@@ -194,6 +219,8 @@ func (c *Checker) RunOnce(ctx context.Context) {
 func (c *Checker) report(findings []egressFinding, settings config.AntiBanIPCheck) {
 	var datacenterIDs []string
 	ipToAuths := make(map[string][]string)
+	entries := make([]StatusEntry, 0, len(findings))
+	now := time.Now().Format(time.RFC3339)
 
 	// Seed of credentials already blocked from a prior pass. A credential is only
 	// unblocked by a fresh confirmed-clean result; a transient lookup failure must
@@ -217,6 +244,7 @@ func (c *Checker) report(findings []egressFinding, settings config.AntiBanIPChec
 				datacenterIDs = append(datacenterIDs, f.authID)
 				log.Warnf("anti-ban ip-check: credential %s stays blocked (prior datacenter detection retained across failed re-check)", f.label)
 			}
+			entries = append(entries, StatusEntry{AuthID: f.authID, Label: f.label, CheckedAt: now, Error: f.err.Error()})
 			continue
 		}
 		r := f.result
@@ -236,6 +264,16 @@ func (c *Checker) report(findings []egressFinding, settings config.AntiBanIPChec
 		if r.ip != "" {
 			ipToAuths[r.ip] = append(ipToAuths[r.ip], f.label)
 		}
+		entries = append(entries, StatusEntry{
+			AuthID:       f.authID,
+			Label:        f.label,
+			IP:           r.ip,
+			Country:      r.country,
+			ISP:          r.isp,
+			IsDatacenter: r.isDatacenter || r.isHosting,
+			Source:       r.source,
+			CheckedAt:    now,
+		})
 
 		// Geo + stability checks (deployment guide: pin the exit to a US
 		// residential IP; a residential user does not hop IPs or countries).
@@ -280,6 +318,21 @@ func (c *Checker) report(findings []egressFinding, settings config.AntiBanIPChec
 			// pass had blocked, so toggling strict off cannot strand accounts.
 			c.setBlock(nil)
 		}
+	}
+
+	// Publish the snapshot for the management API, marking which entries ended up
+	// held out of rotation this pass.
+	if c.publish != nil {
+		blocked := make(map[string]struct{}, len(datacenterIDs))
+		for _, id := range datacenterIDs {
+			blocked[id] = struct{}{}
+		}
+		for i := range entries {
+			if _, ok := blocked[entries[i].AuthID]; ok {
+				entries[i].Blocked = true
+			}
+		}
+		c.publish(entries)
 	}
 }
 

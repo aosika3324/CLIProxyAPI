@@ -365,3 +365,28 @@ func TestReserveWaitIsBounded(t *testing.T) {
 		}
 	}
 }
+
+func TestEgressStatusRoundTrip(t *testing.T) {
+	SetEgressStatus(nil)
+	if GetEgressStatus() != nil {
+		t.Fatal("should be nil when unset")
+	}
+	in := []EgressStatus{
+		{AuthID: "a1", IP: "1.1.1.1", Country: "US", Blocked: false},
+		{AuthID: "a2", IP: "2.2.2.2", Country: "DE", Blocked: true},
+	}
+	SetEgressStatus(in)
+	got := GetEgressStatus()
+	if len(got) != 2 || got[1].AuthID != "a2" || !got[1].Blocked {
+		t.Fatalf("round-trip mismatch: %+v", got)
+	}
+	// Returned slice must be a copy (mutating it must not affect stored state).
+	got[0].IP = "9.9.9.9"
+	if GetEgressStatus()[0].IP != "1.1.1.1" {
+		t.Fatal("GetEgressStatus must return a defensive copy")
+	}
+	SetEgressStatus(nil)
+	if GetEgressStatus() != nil {
+		t.Fatal("clearing should reset to nil")
+	}
+}

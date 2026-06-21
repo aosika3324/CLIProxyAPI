@@ -1514,7 +1514,25 @@ func (s *Service) ensureAntiBanIPChecker(ctx context.Context) {
 			defer s.cfgMu.RUnlock()
 			return s.cfg
 		}
-		s.antiBanChecker = antiban.NewChecker(lister, getCfg, coreauth.SetDatacenterBlockedAuths, coreauth.GetDatacenterBlockedAuths)
+		publish := func(entries []antiban.StatusEntry) {
+			out := make([]coreauth.EgressStatus, 0, len(entries))
+			for _, e := range entries {
+				out = append(out, coreauth.EgressStatus{
+					AuthID:       e.AuthID,
+					Label:        e.Label,
+					IP:           e.IP,
+					Country:      e.Country,
+					ISP:          e.ISP,
+					IsDatacenter: e.IsDatacenter,
+					Blocked:      e.Blocked,
+					Source:       e.Source,
+					CheckedAt:    e.CheckedAt,
+					Error:        e.Error,
+				})
+			}
+			coreauth.SetEgressStatus(out)
+		}
+		s.antiBanChecker = antiban.NewChecker(lister, getCfg, coreauth.SetDatacenterBlockedAuths, coreauth.GetDatacenterBlockedAuths, publish)
 	}
 	s.antiBanChecker.Start(ctx)
 }

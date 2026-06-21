@@ -634,6 +634,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/proxy-url", s.mgmt.PutProxyURL)
 		mgmt.PATCH("/proxy-url", s.mgmt.PutProxyURL)
 		mgmt.DELETE("/proxy-url", s.mgmt.DeleteProxyURL)
+		mgmt.GET("/anti-ban/egress-status", s.mgmt.GetAntiBanEgressStatus)
 
 		mgmt.POST("/api-call", s.mgmt.APICall)
 
