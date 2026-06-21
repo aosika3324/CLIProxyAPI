@@ -100,6 +100,11 @@ Full CLIProxyAPI management center with request-level monitoring and cost estima
 - Watcher: [docs/sdk-watcher.md](docs/sdk-watcher.md)
 - Custom Provider Example: `examples/custom-provider`
 
+## Claude Anti-Ban
+
+- 账号防封使用指南(中文): [docs/anti-ban_CN.md](docs/anti-ban_CN.md)
+
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
