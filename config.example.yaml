@@ -173,6 +173,13 @@ anti-ban:
     strict-datacenter: false
     # When true, warn when more than one credential resolves to the same egress IP.
     warn-shared-egress: true
+    # When true, warn when a credential's egress IP (or country) changes between
+    # checks — a residential user does not hop IPs. Needs interval-minutes > 0 to
+    # observe more than one sample.
+    warn-ip-change: true
+    # ISO country code the egress IP is expected to resolve to (e.g. "US"). Warns
+    # on any credential leaving from a different country. Empty disables the check.
+    expected-country: ""
 # ----------------------------------------------------------------------------
 
 # When true, globally disable Claude request cloaking (the Claude Code CLI disguise and

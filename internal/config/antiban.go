@@ -1,6 +1,8 @@
 // Package config provides configuration management for the CLI Proxy API server.
 package config
 
+import "strings"
+
 // AntiBan groups Claude anti-ban controls that reduce the chance an account is
 // flagged by Anthropic's risk system. The request-layer Claude Code fingerprint
 // (Beta headers, billing header, User-Agent, session id) is always applied by the
@@ -76,6 +78,19 @@ type AntiBanIPCheck struct {
 	// when more than one credential resolves to the same egress IP (the deployment
 	// guide's "one IP, many accounts = detected as account sharing" rule).
 	WarnSharedEgress bool `yaml:"warn-shared-egress" json:"warn-shared-egress"`
+
+	// WarnIPChange, when true (default when IPCheck.Enabled), logs a warning when a
+	// credential's egress IP changes between checks (the deployment guide's
+	// "frequent IP changes" / "the IP must not lapse" red lines: a residential user
+	// does not hop IPs, so drift signals a proxy/renewal problem). Detection needs
+	// IntervalMinutes > 0 to observe more than one sample.
+	WarnIPChange bool `yaml:"warn-ip-change" json:"warn-ip-change"`
+
+	// ExpectedCountry, when set to an ISO country code (e.g. "US"), warns whenever a
+	// credential's egress IP resolves outside that country (the guide pins the exit
+	// to a US residential IP). Empty disables the country check; a change of country
+	// between checks is always warned when WarnIPChange is on.
+	ExpectedCountry string `yaml:"expected-country" json:"expected-country"`
 }
 
 // NormalizeAntiBan clamps anti-ban values into sane ranges. It is safe to call on
@@ -107,4 +122,6 @@ func (cfg *Config) NormalizeAntiBan() {
 	if ab.IPCheck.TimeoutSeconds < 0 {
 		ab.IPCheck.TimeoutSeconds = 0
 	}
+	// Normalize the expected country to an uppercase ISO code for comparison.
+	ab.IPCheck.ExpectedCountry = strings.ToUpper(strings.TrimSpace(ab.IPCheck.ExpectedCountry))
 }

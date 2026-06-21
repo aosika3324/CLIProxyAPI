@@ -152,3 +152,41 @@ func TestReportStrictOffReleasesBlocks(t *testing.T) {
 		t.Fatalf("strict-off pass must clear blocks, got %v", blocked)
 	}
 }
+
+// TestReportWarnsOnIPChange verifies a credential's egress IP change is detected
+// across two passes (frequent-IP-change red line). It is log-only, so we assert
+// the history is updated and the second pass sees the prior observation.
+func TestReportWarnsOnIPChange(t *testing.T) {
+	c := &Checker{}
+	settings := config.AntiBanIPCheck{WarnIPChange: true}
+
+	c.report([]egressFinding{
+		{authID: "a1", label: "acc-1", result: ipResult{ip: "1.1.1.1", country: "US", source: "ipapi.is"}},
+	}, settings)
+	obs, ok := c.lastObservation("a1")
+	if !ok || obs.ip != "1.1.1.1" {
+		t.Fatalf("first pass must record ip, got %+v ok=%v", obs, ok)
+	}
+
+	// Second pass with a different IP: history must update to the new IP.
+	c.report([]egressFinding{
+		{authID: "a1", label: "acc-1", result: ipResult{ip: "2.2.2.2", country: "US", source: "ipapi.is"}},
+	}, settings)
+	obs, _ = c.lastObservation("a1")
+	if obs.ip != "2.2.2.2" {
+		t.Fatalf("second pass must update recorded ip, got %q", obs.ip)
+	}
+}
+
+// TestReportNoHistoryWhenIPChangeOff verifies history is not recorded when the
+// stability check is disabled (avoids unbounded growth when unused).
+func TestReportNoHistoryWhenIPChangeOff(t *testing.T) {
+	c := &Checker{}
+	settings := config.AntiBanIPCheck{WarnIPChange: false}
+	c.report([]egressFinding{
+		{authID: "a1", label: "acc-1", result: ipResult{ip: "1.1.1.1", country: "US"}},
+	}, settings)
+	if _, ok := c.lastObservation("a1"); ok {
+		t.Fatal("history must not be recorded when WarnIPChange is off")
+	}
+}

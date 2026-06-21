@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -52,6 +53,7 @@ type ipResult struct {
 	isHosting    bool
 	isp          string
 	hostname     string
+	country      string // ISO country code (e.g. "US"), best-effort
 	source       string
 }
 
@@ -75,6 +77,18 @@ type Checker struct {
 	// duplicate loops, and will (re)start the loop after it has exited (one-shot
 	// completed, or the feature was toggled off then on again).
 	running atomic.Bool
+
+	// histMu guards history, the per-auth record of the last observed egress so
+	// the next pass can detect IP changes and country drift.
+	histMu  sync.Mutex
+	history map[string]egressObservation
+}
+
+// egressObservation is the last egress seen for one credential.
+type egressObservation struct {
+	ip      string
+	country string
+	at      time.Time
 }
 
 // NewChecker builds a checker. lister enumerates credentials, getCfg returns the
@@ -222,6 +236,26 @@ func (c *Checker) report(findings []egressFinding, settings config.AntiBanIPChec
 		if r.ip != "" {
 			ipToAuths[r.ip] = append(ipToAuths[r.ip], f.label)
 		}
+
+		// Geo + stability checks (deployment guide: pin the exit to a US
+		// residential IP; a residential user does not hop IPs or countries).
+		if settings.ExpectedCountry != "" && r.country != "" && r.country != settings.ExpectedCountry {
+			log.Warnf("anti-ban ip-check: credential %s egress IP %s is in %s, expected %s — geo mismatch (out-of-region risk)",
+				f.label, r.ip, r.country, settings.ExpectedCountry)
+		}
+		if settings.WarnIPChange && r.ip != "" {
+			if prev, ok := c.lastObservation(f.authID); ok {
+				if prev.ip != "" && prev.ip != r.ip {
+					log.Warnf("anti-ban ip-check: credential %s egress IP changed %s → %s since %s — frequent IP changes look abnormal to Anthropic",
+						f.label, prev.ip, r.ip, prev.at.Format(time.RFC3339))
+				}
+				if prev.country != "" && r.country != "" && prev.country != r.country {
+					log.Warnf("anti-ban ip-check: credential %s egress country changed %s → %s — strong out-of-region signal",
+						f.label, prev.country, r.country)
+				}
+			}
+			c.recordObservation(f.authID, r.ip, r.country)
+		}
 	}
 
 	if settings.WarnSharedEgress {
@@ -247,6 +281,25 @@ func (c *Checker) report(findings []egressFinding, settings config.AntiBanIPChec
 			c.setBlock(nil)
 		}
 	}
+}
+
+// lastObservation returns the previously recorded egress for an auth, if any.
+func (c *Checker) lastObservation(authID string) (egressObservation, bool) {
+	c.histMu.Lock()
+	defer c.histMu.Unlock()
+	obs, ok := c.history[authID]
+	return obs, ok
+}
+
+// recordObservation stores the latest egress for an auth so the next pass can
+// detect IP changes and country drift.
+func (c *Checker) recordObservation(authID, ip, country string) {
+	c.histMu.Lock()
+	defer c.histMu.Unlock()
+	if c.history == nil {
+		c.history = make(map[string]egressObservation)
+	}
+	c.history[authID] = egressObservation{ip: ip, country: country, at: time.Now()}
 }
 
 func authDisplayName(a AuthSnapshot) string {
@@ -303,6 +356,9 @@ func lookupEgress(ctx context.Context, proxyURL string, timeout time.Duration) (
 		if merged.hostname == "" {
 			merged.hostname = r.hostname
 		}
+		if merged.country == "" {
+			merged.country = r.country
+		}
 	}
 	if !got {
 		return ipResult{}, fmt.Errorf("all egress IP reputation lookups failed")
@@ -348,6 +404,9 @@ func queryIPApiIs(ctx context.Context, client *http.Client) (ipResult, bool) {
 		Datacenter struct {
 			Datacenter string `json:"datacenter"`
 		} `json:"datacenter"`
+		Location struct {
+			CountryCode string `json:"country_code"`
+		} `json:"location"`
 	}
 	if !fetchJSON(ctx, client, "https://api.ipapi.is/", &payload) || payload.IP == "" {
 		return ipResult{}, false
@@ -360,23 +419,25 @@ func queryIPApiIs(ctx context.Context, client *http.Client) (ipResult, bool) {
 		ip:           payload.IP,
 		isDatacenter: payload.IsDatacenter || payload.Datacenter.Datacenter != "",
 		isp:          isp,
+		country:      strings.ToUpper(strings.TrimSpace(payload.Location.CountryCode)),
 		source:       "ipapi.is",
 	}, true
 }
 
 func queryIPApiCom(ctx context.Context, client *http.Client) (ipResult, bool) {
 	var payload struct {
-		Status  string `json:"status"`
-		Query   string `json:"query"`
-		ISP     string `json:"isp"`
-		Org     string `json:"org"`
-		Hosting bool   `json:"hosting"`
-		Proxy   bool   `json:"proxy"`
+		Status      string `json:"status"`
+		Query       string `json:"query"`
+		ISP         string `json:"isp"`
+		Org         string `json:"org"`
+		CountryCode string `json:"countryCode"`
+		Hosting     bool   `json:"hosting"`
+		Proxy       bool   `json:"proxy"`
 	}
 	// Request the hosting/proxy fields explicitly. A failed query still echoes a
 	// non-empty "query", so we must gate on status=="success" too — otherwise a
 	// failure (missing hosting/proxy fields default to false) is read as a clean IP.
-	if !fetchJSON(ctx, client, "https://ip-api.com/json/?fields=status,query,isp,org,hosting,proxy", &payload) || payload.Query == "" || payload.Status != "success" {
+	if !fetchJSON(ctx, client, "https://ip-api.com/json/?fields=status,query,isp,org,countryCode,hosting,proxy", &payload) || payload.Query == "" || payload.Status != "success" {
 		return ipResult{}, false
 	}
 	isp := payload.ISP
@@ -387,6 +448,7 @@ func queryIPApiCom(ctx context.Context, client *http.Client) (ipResult, bool) {
 		ip:        payload.Query,
 		isHosting: payload.Hosting || payload.Proxy,
 		isp:       isp,
+		country:   strings.ToUpper(strings.TrimSpace(payload.CountryCode)),
 		source:    "ip-api.com",
 	}, true
 }
@@ -396,6 +458,7 @@ func queryIPInfo(ctx context.Context, client *http.Client) (ipResult, bool) {
 		IP       string `json:"ip"`
 		Org      string `json:"org"`
 		Hostname string `json:"hostname"`
+		Country  string `json:"country"`
 	}
 	if !fetchJSON(ctx, client, "https://ipinfo.io/json", &payload) || payload.IP == "" {
 		return ipResult{}, false
@@ -413,6 +476,7 @@ func queryIPInfo(ctx context.Context, client *http.Client) (ipResult, bool) {
 		isDatacenter: suspect,
 		isp:          payload.Org,
 		hostname:     payload.Hostname,
+		country:      strings.ToUpper(strings.TrimSpace(payload.Country)),
 		source:       "ipinfo.io",
 	}, true
 }
