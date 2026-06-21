@@ -133,6 +133,12 @@ func (c *Checker) loop(ctx context.Context) {
 func (c *Checker) RunOnce(ctx context.Context) {
 	cfg := c.getCfg()
 	if cfg == nil || !cfg.AntiBan.Enabled || !cfg.AntiBan.IPCheck.Enabled {
+		// The self-check is off: release any credentials a prior pass had held out
+		// of rotation, so disabling ip-check (while anti-ban stays on) cannot leave
+		// accounts permanently blocked.
+		if c.setBlock != nil {
+			c.setBlock(nil)
+		}
 		return
 	}
 	settings := cfg.AntiBan.IPCheck
@@ -228,11 +234,17 @@ func (c *Checker) report(findings []egressFinding, settings config.AntiBanIPChec
 		}
 	}
 
-	if c.setBlock != nil && settings.StrictDatacenter {
-		sort.Strings(datacenterIDs)
-		c.setBlock(datacenterIDs)
-		if len(datacenterIDs) > 0 {
-			log.Warnf("anti-ban ip-check: %d credential(s) held out of rotation due to datacenter egress IPs", len(datacenterIDs))
+	if c.setBlock != nil {
+		if settings.StrictDatacenter {
+			sort.Strings(datacenterIDs)
+			c.setBlock(datacenterIDs)
+			if len(datacenterIDs) > 0 {
+				log.Warnf("anti-ban ip-check: %d credential(s) held out of rotation due to datacenter egress IPs", len(datacenterIDs))
+			}
+		} else {
+			// Strict mode is off this pass: release any credentials a prior strict
+			// pass had blocked, so toggling strict off cannot strand accounts.
+			c.setBlock(nil)
 		}
 	}
 }

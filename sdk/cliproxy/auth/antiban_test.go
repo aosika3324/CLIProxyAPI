@@ -226,6 +226,8 @@ func TestAntiBanRequireProxy(t *testing.T) {
 func TestDatacenterBlockedSet(t *testing.T) {
 	resetAntiBan()
 	defer resetAntiBan()
+	// antiBanDatacenterBlocked is gated on anti-ban being enabled.
+	SetAntiBanConfig(true, 0, 0, 0, 0, 0, false)
 	if antiBanDatacenterBlocked("a") {
 		t.Fatal("should be empty initially")
 	}

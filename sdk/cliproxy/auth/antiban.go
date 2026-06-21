@@ -98,9 +98,15 @@ func SetDatacenterBlockedAuths(ids []string) {
 }
 
 // antiBanDatacenterBlocked reports whether the given auth ID is currently blocked
-// by the egress IP self-check strict mode.
+// by the egress IP self-check strict mode. It returns false whenever anti-ban is
+// disabled, so toggling the feature off immediately releases any credentials the
+// self-check had held out of rotation (the block set is also cleared on disable;
+// this guard additionally covers the window before that clear runs).
 func antiBanDatacenterBlocked(authID string) bool {
 	if authID == "" {
+		return false
+	}
+	if s := antiBan.settings.load(); s == nil || !s.enabled {
 		return false
 	}
 	datacenterBlocked.mu.RLock()
@@ -132,6 +138,9 @@ func GetDatacenterBlockedAuths() []string {
 func SetAntiBanConfig(enabled bool, maxConcurrentPerAuth, concurrencyWaitMS, jitterMinMS, jitterMaxMS, minIntervalMS int, requireProxy bool) {
 	if !enabled {
 		antiBan.settings.store(nil)
+		// Release any credentials the egress self-check held out of rotation, so
+		// disabling anti-ban cannot leave accounts permanently blocked.
+		SetDatacenterBlockedAuths(nil)
 		return
 	}
 	s := &antiBanSettings{

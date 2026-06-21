@@ -25,11 +25,11 @@ func TestReportFlagsDatacenterAndStrictBlocks(t *testing.T) {
 	}
 }
 
-func TestReportNonStrictDoesNotBlock(t *testing.T) {
-	var blocked []string
-	called := false
+func TestReportNonStrictClearsBlocks(t *testing.T) {
+	blocked := []string{"prev"}
 	c := &Checker{
-		setBlock: func(ids []string) { called = true; blocked = ids },
+		setBlock:   func(ids []string) { blocked = ids },
+		getBlocked: func() []string { return blocked },
 	}
 	settings := config.AntiBanIPCheck{StrictDatacenter: false, WarnSharedEgress: true}
 
@@ -38,9 +38,10 @@ func TestReportNonStrictDoesNotBlock(t *testing.T) {
 	}
 	c.report(findings, settings)
 
-	// In non-strict mode setBlock must not be invoked at all.
-	if called {
-		t.Fatalf("non-strict mode must not call setBlock, got %v", blocked)
+	// In non-strict mode no credential is held out of rotation, and any prior
+	// block is released (setBlock(nil)).
+	if blocked != nil {
+		t.Fatalf("non-strict mode must release blocks, got %v", blocked)
 	}
 }
 
@@ -113,5 +114,41 @@ func TestReportClearsBlockOnConfirmedClean(t *testing.T) {
 
 	if len(blocked) != 0 {
 		t.Fatalf("a1 must be unblocked after a confirmed-clean check, got %v", blocked)
+	}
+}
+
+// TestRunOnceClearsBlocksWhenDisabled verifies that an ip-check pass running while
+// the feature (or ip-check) is disabled releases any prior strict-mode blocks,
+// rather than leaving credentials stranded.
+func TestRunOnceClearsBlocksWhenDisabled(t *testing.T) {
+	var blocked = []string{"stale"}
+	c := NewChecker(
+		func() []AuthSnapshot { return nil },
+		func() *config.Config { return &config.Config{} }, // anti-ban disabled
+		func(ids []string) { blocked = ids },
+		func() []string { return blocked },
+	)
+	c.RunOnce(context.Background())
+	if blocked != nil {
+		t.Fatalf("disabled ip-check pass must clear blocks, got %v", blocked)
+	}
+}
+
+// TestReportStrictOffReleasesBlocks verifies that a pass with strict mode off
+// releases prior blocks instead of leaving them in place.
+func TestReportStrictOffReleasesBlocks(t *testing.T) {
+	var blocked = []string{"prev"}
+	c := &Checker{
+		setBlock:   func(ids []string) { blocked = ids },
+		getBlocked: func() []string { return blocked },
+	}
+	// Strict off: even a datacenter finding must not block, and prior blocks clear.
+	settings := config.AntiBanIPCheck{StrictDatacenter: false, WarnSharedEgress: true}
+	findings := []egressFinding{
+		{authID: "x", label: "acc-x", result: ipResult{ip: "1.1.1.1", isDatacenter: true, source: "ipapi.is"}},
+	}
+	c.report(findings, settings)
+	if blocked != nil {
+		t.Fatalf("strict-off pass must clear blocks, got %v", blocked)
 	}
 }
